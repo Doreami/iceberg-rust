@@ -23,6 +23,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use arrow_array::{Int64Array, RecordBatch, UInt64Array};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
@@ -37,7 +38,7 @@ use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
+use crate::metadata_columns::{RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::Datum;
 use crate::{Error, ErrorKind};
@@ -211,7 +212,7 @@ impl FileScanTaskReader {
         let mut record_batch_stream_builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
-        // Filter out metadata fields for Parquet projection (they don't exist in files)
+        // Filter out metadata fields for Parquet projection.
         let project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
@@ -237,9 +238,24 @@ impl FileScanTaskReader {
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
         // that come back from the file, such as type promotion, default column insertion,
-        // column re-ordering, partition constants, and virtual field addition (like _file)
+        // column re-ordering, partition constants, and virtual field addition (like _file).
+        //
+        // _pos is always a per-row computed column (not a constant) and is appended in
+        // post-processing below.
+        //
+        // _row_id — always computed dynamically from firstRowId + position.
+        // _pos    — always computed as the per-file row-position counter.
+        // Both are excluded from the transformer because their field IDs are not in
+        // the Iceberg table schema (transformer rejects unknown IDs), and appended
+        // in post-processing below.
+        let transformer_field_ids: Vec<i32> = task
+            .project_field_ids()
+            .iter()
+            .copied()
+            .filter(|&id| id != RESERVED_FIELD_ID_POS && id != RESERVED_FIELD_ID_ROW_ID)
+            .collect();
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), &transformer_field_ids);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -391,16 +407,77 @@ impl FileScanTaskReader {
 
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester.
+        //
+        // Determine if _pos or _row_id metadata columns are requested.
+        // Both share a row-position counter that starts at 0 for each file.
+        let project_pos = task.project_field_ids.contains(&RESERVED_FIELD_ID_POS);
+        let project_row_id = task.project_field_ids.contains(&RESERVED_FIELD_ID_ROW_ID);
+        let append_pos_or_row_id = project_pos || project_row_id;
+        let first_row_id = task.first_row_id;
+
         let record_batch_stream =
             record_batch_stream_builder
                 .build()?
                 .map(move |batch| match batch {
-                    Ok(batch) => {
-                        // Process the record batch (type promotion, column reordering, virtual fields, etc.)
-                        record_batch_transformer.process_record_batch(batch)
-                    }
+                    Ok(batch) => record_batch_transformer.process_record_batch(batch),
                     Err(err) => Err(err.into()),
                 });
+
+        // If _pos or _row_id are requested, append them after transformation.
+        // The counter only counts live rows (delete files have already been filtered).
+        if append_pos_or_row_id {
+            let mut row_position: u64 = 0;
+            let stream = record_batch_stream.map(move |result| {
+                result.map(|batch| {
+                    let num_rows = batch.num_rows();
+                    let pos_array = if project_pos {
+                        Some(Arc::new(UInt64Array::from_iter(
+                            row_position..row_position + num_rows as u64,
+                        )) as Arc<dyn arrow_array::Array>)
+                    } else {
+                        None
+                    };
+                    let row_id_array = if project_row_id {
+                        let base = first_row_id.unwrap_or(0);
+                        Some(Arc::new(Int64Array::from_iter(
+                            (row_position..row_position + num_rows as u64)
+                                .map(|pos| (base + pos) as i64),
+                        )) as Arc<dyn arrow_array::Array>)
+                    } else {
+                        None
+                    };
+                    row_position += num_rows as u64;
+
+                    let mut columns: Vec<Arc<dyn arrow_array::Array>> =
+                        batch.columns().to_vec();
+                    let mut schema_fields = batch.schema().fields().to_vec();
+
+                    if let Some(arr) = pos_array {
+                        columns.push(arr);
+                        schema_fields.push(Arc::new(arrow_schema::Field::new(
+                            "_pos",
+                            arrow_schema::DataType::UInt64,
+                            false,
+                        )));
+                    }
+                    if let Some(arr) = row_id_array {
+                        columns.push(arr);
+                        schema_fields.push(Arc::new(arrow_schema::Field::new(
+                            "_row_id",
+                            arrow_schema::DataType::Int64,
+                            false,
+                        )));
+                    }
+
+                    RecordBatch::try_new(
+                        Arc::new(arrow_schema::Schema::new(schema_fields)),
+                        columns,
+                    )
+                    .expect("Failed to build RecordBatch with _pos/_row_id columns")
+                })
+            });
+            return Ok(Box::pin(stream) as ArrowRecordBatchStream);
+        }
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }

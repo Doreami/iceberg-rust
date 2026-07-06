@@ -67,6 +67,11 @@ pub struct FileScanTask {
     #[builder(default)]
     pub record_count: Option<u64>,
 
+    /// The _row_id for the first row in this data file (v3 Row Lineage).
+    /// When set, the reader can compute _row_id as first_row_id + position.
+    #[builder(default)]
+    pub first_row_id: Option<u64>,
+
     /// The data file path corresponding to the task.
     pub data_file_path: String,
 
