@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_schema::{Field, Schema as ArrowSchema};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -27,6 +28,7 @@ use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
@@ -37,6 +39,7 @@ use crate::arrow::{
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
 };
 use crate::io::{FileIO, FileWrite, OutputFile};
+use crate::metadata_columns::{RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_ROW_ID};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
     NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
@@ -524,12 +527,45 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            // Build the Arrow schema from the Iceberg table schema.
+            let base_arrow_schema: ArrowSchema = self.schema.as_ref().try_into()?;
+
+            // If the incoming batch carries a _row_id column, extend the Arrow
+            // schema with the _row_id metadata field so it is written as a
+            // physical Parquet column.  This is the write side of M4 — it
+            // preserves original RowID values through Compaction.
+            let has_row_id = batch
+                .schema()
+                .column_with_name(RESERVED_COL_NAME_ROW_ID)
+                .is_some();
+            let arrow_schema: ArrowSchema = if has_row_id {
+                let mut fields: Vec<Arc<Field>> =
+                    base_arrow_schema.fields().iter().cloned().collect();
+                let mut row_id_metadata = HashMap::new();
+                row_id_metadata.insert(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    RESERVED_FIELD_ID_ROW_ID.to_string(),
+                );
+                let row_id_field = Arc::new(
+                    Field::new(
+                        RESERVED_COL_NAME_ROW_ID,
+                        arrow_schema::DataType::Int64,
+                        false, // not nullable
+                    )
+                    .with_metadata(row_id_metadata),
+                );
+                fields.push(row_id_field);
+                ArrowSchema::new(fields)
+            } else {
+                base_arrow_schema
+            };
+
+            let arrow_schema_ref: ArrowSchemaRef = Arc::new(arrow_schema);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
                 async_writer,
-                arrow_schema.clone(),
+                arrow_schema_ref.clone(),
                 Some(self.writer_properties.clone()),
             )
             .map_err(|err| {
@@ -2390,5 +2426,81 @@ mod tests {
         assert_eq!(cdc.min_chunk_size, 4096);
         assert_eq!(cdc.max_chunk_size, 8192);
         assert_eq!(cdc.norm_level, 2);
+    }
+
+    // ─── M4: _row_id physical column write ─────────────────────────────
+
+    /// Verifies that when a RecordBatch contains a `_row_id` column, the
+    /// writer adds the `_row_id` field to the Arrow schema with field ID
+    /// `i32::MAX - 107` so it is written as a physical Parquet column.
+    #[tokio::test]
+    async fn test_write_physical_row_id_column() -> Result<()> {
+        use crate::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+
+        let temp_dir = TempDir::new()?;
+
+        let schema = Arc::new(
+            IcebergSchema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "value".to_string(),
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()?,
+        );
+
+        // Create a batch with _row_id column to simulate compaction re-write.
+        // The _row_id field must carry PARQUET_FIELD_ID_META_KEY with the
+        // reserved field ID so the writer recognizes it as a physical column.
+        let value_col: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let row_id_col: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 101, 102]));
+        let mut row_id_meta = HashMap::new();
+        row_id_meta.insert(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            crate::metadata_columns::RESERVED_FIELD_ID_ROW_ID.to_string(),
+        );
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("value", DataType::Int32, false)
+                .with_metadata(HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())])),
+            Field::new("_row_id", DataType::Int64, false)
+                .with_metadata(row_id_meta),
+        ]));
+        let batch = RecordBatch::try_new(batch_schema, vec![value_col, row_id_col])?;
+
+        let file_io = FileIO::new_with_fs();
+        let output = file_io.new_output(
+            &temp_dir.path().join("test_row_id.parquet").to_str().unwrap(),
+        )?;
+
+        let props = WriterProperties::default();
+        let mut writer = ParquetWriterBuilder::new(props, schema.clone())
+            .build(output)
+            .await?;
+        writer.write(&batch).await?;
+        let builders = writer.close().await?;
+        assert_eq!(builders.len(), 1);
+
+        // Build DataFile and verify
+        let data_file = builders[0].clone().build()?;
+        let file_path = data_file.file_path().to_string();
+
+        // Read back the Parquet file to verify _row_id column exists
+        let input = file_io.new_input(&file_path)?;
+        let file_meta = input.metadata().await?;
+        let reader = input.reader().await?;
+        let mut parquet_reader = ArrowFileReader::new(file_meta, reader);
+        let parquet_meta = parquet_reader.get_metadata(None).await?;
+        let file_schema = parquet_meta.file_metadata().schema_descr();
+
+        let has_row_id_col = file_schema
+            .columns()
+            .iter()
+            .any(|c| c.name() == "_row_id");
+        assert!(
+            has_row_id_col,
+            "_row_id column should exist as physical column in written Parquet file"
+        );
+
+        Ok(())
     }
 }
