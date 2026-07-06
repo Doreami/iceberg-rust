@@ -642,21 +642,21 @@ mod test_row_lineage {
     use crate::transaction::tests::make_v3_minimal_table_in_catalog;
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
+    fn file_with_rows(record_count: u64) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("test/{record_count}.parquet"))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(record_count)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_fast_append_with_row_lineage() {
-        // Helper function to create a data file with specified number of rows
-        fn file_with_rows(record_count: u64) -> DataFile {
-            DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(format!("test/{record_count}.parquet"))
-                .file_format(DataFileFormat::Parquet)
-                .file_size_in_bytes(100)
-                .record_count(record_count)
-                .partition(Struct::from_iter([Some(Literal::long(0))]))
-                .partition_spec_id(0)
-                .build()
-                .unwrap()
-        }
         let catalog = new_memory_catalog().await;
 
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
@@ -720,5 +720,99 @@ mod test_row_lineage {
             .map(|e| e.data_file().first_row_id())
             .collect();
         assert_eq!(per_file_ids, vec![Some(30), Some(47)]);
+    }
+
+    /// Ported from Java `testMultipleFileAppends`.
+    /// Verifies that sequential append transactions receive contiguous RowIDs.
+    #[tokio::test]
+    async fn test_multiple_file_appends() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        assert_eq!(table.metadata().next_row_id(), 0);
+
+        // Append 1: 10 rows
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file_with_rows(10)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(table.metadata().next_row_id(), 10);
+
+        // Append 2: 20 rows (should start from 10)
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file_with_rows(20)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(table.metadata().next_row_id(), 30);
+
+        // Append 3: 15 rows (should start from 30)
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![file_with_rows(15)])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        assert_eq!(table.metadata().next_row_id(), 45);
+
+        // Verify next_row_id is the sum of all appends
+        assert_eq!(table.metadata().next_row_id(), 45);
+
+        // Verify we have at least the 3 snapshots we created
+        let snapshots: Vec<_> = table.metadata().snapshots().collect();
+        assert!(snapshots.len() >= 3, "expected at least 3 snapshots");
+    }
+
+    /// Ported from Java `testOverrideFirstRowId`, adapted for our preserve behavior.
+    /// When a DataFile arrives with a preset first_row_id, the manifest writer
+    /// preserves it (unlike Java which overrides).  The cursor still advances
+    /// past the preset range.
+    #[tokio::test]
+    async fn test_preserve_first_row_id() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Create a DataFile with a pre-set first_row_id (like from compaction)
+        let with_preset = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/preset.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .first_row_id(Some(1000))
+            .build()
+            .unwrap();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![with_preset])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot first_row_id starts from table's next_row_id (0)
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.first_row_id(), Some(0));
+
+        // Per-DataFile first_row_id should preserve the preset value
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let manifest = manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        let per_file_ids: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file().first_row_id())
+            .collect();
+        assert_eq!(per_file_ids, vec![Some(1000)]);
     }
 }
