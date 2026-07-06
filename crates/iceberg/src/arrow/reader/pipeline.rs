@@ -213,10 +213,32 @@ impl FileScanTaskReader {
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata);
 
         // Filter out metadata fields for Parquet projection.
+        //
+        // M4 dual-read: if the file has _row_id as a physical column (written
+        // by Compaction), it must be included in the projection so it is read
+        // from the file directly.  Otherwise it is computed in post-processing.
+        let project_row_id = task.project_field_ids.contains(&RESERVED_FIELD_ID_ROW_ID);
+        let has_physical_row_id = project_row_id
+            && record_batch_stream_builder
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| {
+                    f.metadata()
+                        .get(PARQUET_FIELD_ID_META_KEY)
+                        .map(|v| v.parse::<i32>().ok() == Some(RESERVED_FIELD_ID_ROW_ID))
+                        .unwrap_or(false)
+                });
         let project_field_ids_without_metadata: Vec<i32> = task
             .project_field_ids
             .iter()
-            .filter(|&&id| !is_metadata_field(id))
+            .filter(|&&id| {
+                if id == RESERVED_FIELD_ID_ROW_ID && has_physical_row_id {
+                    true // read physical _row_id from file
+                } else {
+                    !is_metadata_field(id)
+                }
+            })
             .copied()
             .collect();
 
@@ -243,11 +265,11 @@ impl FileScanTaskReader {
         // _pos is always a per-row computed column (not a constant) and is appended in
         // post-processing below.
         //
-        // _row_id — always computed dynamically from firstRowId + position.
-        // _pos    — always computed as the per-file row-position counter.
-        // Both are excluded from the transformer because their field IDs are not in
-        // the Iceberg table schema (transformer rejects unknown IDs), and appended
-        // in post-processing below.
+        // _row_id is handled by dual-read (M4):
+        //   - Physical column present → read from file, extracted before transformer,
+        //     re-appended after (the transformer cannot handle field IDs outside the
+        //     Iceberg table schema).
+        //   - Physical column absent  → computed dynamically in post-processing.
         let transformer_field_ids: Vec<i32> = task
             .project_field_ids()
             .iter()
@@ -411,15 +433,54 @@ impl FileScanTaskReader {
         // Determine if _pos or _row_id metadata columns are requested.
         // Both share a row-position counter that starts at 0 for each file.
         let project_pos = task.project_field_ids.contains(&RESERVED_FIELD_ID_POS);
-        let project_row_id = task.project_field_ids.contains(&RESERVED_FIELD_ID_ROW_ID);
-        let append_pos_or_row_id = project_pos || project_row_id;
+        // project_row_id and has_physical_row_id are computed earlier (see M4 dual-read).
+        // Only append _pos (always virtual) or _row_id when computed dynamically.
+        let append_pos_or_row_id = project_pos || (project_row_id && !has_physical_row_id);
         let first_row_id = task.first_row_id;
 
         let record_batch_stream =
             record_batch_stream_builder
                 .build()?
                 .map(move |batch| match batch {
-                    Ok(batch) => record_batch_transformer.process_record_batch(batch),
+                    Ok(batch) => {
+                        // M4 dual-read: if the file has a physical _row_id column,
+                        // extract it before the transformer (which drops unknown
+                        // field IDs) and re-append it afterwards.
+                        let row_id_col = if has_physical_row_id {
+                            batch
+                                .schema()
+                                .column_with_name(RESERVED_COL_NAME_ROW_ID)
+                                .map(|(idx, _)| batch.column(idx).clone())
+                        } else {
+                            None
+                        };
+                        let mut result =
+                            record_batch_transformer.process_record_batch(batch)?;
+                        if let Some(col) = row_id_col {
+                            let mut columns = result.columns().to_vec();
+                            let mut fields = result.schema().fields().to_vec();
+                            columns.push(col);
+                            fields.push(std::sync::Arc::new(
+                                arrow_schema::Field::new(
+                                    RESERVED_COL_NAME_ROW_ID,
+                                    arrow_schema::DataType::Int64,
+                                    false,
+                                ),
+                            ));
+                            result = RecordBatch::try_new(
+                                std::sync::Arc::new(arrow_schema::Schema::new(fields)),
+                                columns,
+                            )
+                            .map_err(|e| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    "Failed to build RecordBatch with physical _row_id column",
+                                )
+                                .with_source(e)
+                            })?;
+                        }
+                        Ok(result)
+                    }
                     Err(err) => Err(err.into()),
                 });
 
@@ -437,7 +498,7 @@ impl FileScanTaskReader {
                     } else {
                         None
                     };
-                    let row_id_array = if project_row_id {
+                    let row_id_array = if project_row_id && !has_physical_row_id {
                         let base = first_row_id.unwrap_or(0);
                         Some(Arc::new(Int64Array::from_iter(
                             (row_position..row_position + num_rows as u64)
