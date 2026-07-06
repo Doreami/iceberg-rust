@@ -684,6 +684,14 @@ mod test_row_lineage {
         let manifest_file = &manifest_list.entries()[0];
         assert_eq!(manifest_file.first_row_id, Some(0));
 
+        let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+        let first_per_file_ids: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file().first_row_id())
+            .collect();
+        assert_eq!(first_per_file_ids, vec![Some(0)]);
+
         // Second fast append with 17 and 11 rows
         let tx = Transaction::new(&table);
         let data_file_17 = file_with_rows(17);
@@ -704,5 +712,13 @@ mod test_row_lineage {
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));
+
+        let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+        let per_file_ids: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file().first_row_id())
+            .collect();
+        assert_eq!(per_file_ids, vec![Some(30), Some(47)]);
     }
 }

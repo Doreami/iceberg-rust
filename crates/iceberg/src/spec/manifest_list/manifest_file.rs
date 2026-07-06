@@ -22,7 +22,7 @@ use serde_derive::{Deserialize, Serialize};
 use super::ByteBuf;
 use crate::error::Result;
 use crate::io::FileIO;
-use crate::spec::Manifest;
+use crate::spec::{FormatVersion, Manifest, ManifestStatus};
 use crate::{Error, ErrorKind};
 
 /// Entry in a manifest list.
@@ -185,6 +185,39 @@ impl ManifestFile {
         // Let entries inherit values from the manifest list entry.
         for entry in &mut entries {
             entry.inherit_data(self);
+        }
+
+        // For v3 Data manifests, inherit per-DataFile first_row_id using a
+        // running cursor seeded from the manifest-level first_row_id.
+        // This ensures old manifests without per-file ids produce correct
+        // per-file first_row_id values on read.
+        if matches!(metadata.format_version, FormatVersion::V3)
+            && metadata.content == ManifestContentType::Data
+        {
+            if let Some(mut cursor) = self.first_row_id {
+                for entry in &mut entries {
+                    if entry.status == ManifestStatus::Deleted {
+                        continue;
+                    }
+                    if entry.data_file.first_row_id.is_none() {
+                        entry.data_file.first_row_id =
+                            Some(i64::try_from(cursor).map_err(|_| {
+                                Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!("Row ID {cursor} exceeds i64::MAX"),
+                                )
+                            })?);
+                    }
+                    cursor = cursor
+                        .checked_add(entry.data_file.record_count)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Row ID overflow during per-file inheritance",
+                            )
+                        })?;
+                }
+            }
         }
 
         Ok(Manifest::new(metadata, entries))

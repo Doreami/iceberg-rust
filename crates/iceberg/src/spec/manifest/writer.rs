@@ -43,12 +43,24 @@ use crate::{Error, ErrorKind};
 /// with the actual snapshot ID before it is committed.
 const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
+fn u64_to_i64_row_id(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Row ID {value} exceeds i64::MAX and cannot be encoded as DataFile.first_row_id"
+            ),
+        )
+    })
+}
+
 type WriterFuture = Pin<Box<dyn Future<Output = Result<Box<dyn FileWrite>>> + Send>>;
 
 /// The builder used to create a [`ManifestWriter`].
 pub struct ManifestWriterBuilder {
     writer_future: WriterFuture,
     location: String,
+    first_row_id: Option<u64>,
     snapshot_id: Option<i64>,
     key_metadata: Option<Vec<u8>>,
     schema: SchemaRef,
@@ -67,6 +79,7 @@ impl ManifestWriterBuilder {
         Self {
             writer_future: Box::pin(async move { output.writer().await }),
             location,
+            first_row_id: None,
             snapshot_id,
             key_metadata: None,
             schema,
@@ -88,11 +101,18 @@ impl ManifestWriterBuilder {
         Ok(Self {
             writer_future: Box::pin(async move { encrypted_output.writer().await }),
             location,
+            first_row_id: None,
             snapshot_id,
             key_metadata,
             schema,
             partition_spec,
         })
+    }
+
+    /// Seed the manifest-level `first_row_id` for a v3 data manifest.
+    pub fn with_first_row_id(mut self, first_row_id: u64) -> Self {
+        self.first_row_id = Some(first_row_id);
+        self
     }
 
     /// Build a [`ManifestWriter`] for format version 1.
@@ -153,7 +173,7 @@ impl ManifestWriterBuilder {
         )
     }
 
-    /// Build a [`ManifestWriter`] for format version 2, data content.
+    /// Build a [`ManifestWriter`] for format version 3, data content.
     pub fn build_v3_data(self) -> ManifestWriter {
         let metadata = ManifestMetadata::builder()
             .schema_id(self.schema.schema_id())
@@ -168,9 +188,7 @@ impl ManifestWriterBuilder {
             self.snapshot_id,
             self.key_metadata,
             metadata,
-            // First row id is assigned by the [`ManifestListWriter`] when the manifest
-            // is added to the list.
-            None,
+            self.first_row_id,
         )
     }
 
@@ -208,6 +226,7 @@ pub struct ManifestWriter {
     deleted_files: u32,
     deleted_rows: u64,
     first_row_id: Option<u64>,
+    next_data_file_row_id: Option<u64>,
 
     min_seq_num: Option<i64>,
 
@@ -239,6 +258,7 @@ impl ManifestWriter {
             deleted_files: 0,
             deleted_rows: 0,
             first_row_id,
+            next_data_file_row_id: first_row_id,
             min_seq_num: None,
             key_metadata,
             manifest_entries: Vec::new(),
@@ -403,7 +423,7 @@ impl ManifestWriter {
         Ok(())
     }
 
-    fn add_entry_inner(&mut self, entry: ManifestEntry) -> Result<()> {
+    fn add_entry_inner(&mut self, mut entry: ManifestEntry) -> Result<()> {
         // Check if the entry has sequence number
         if (entry.status == ManifestStatus::Deleted || entry.status == ManifestStatus::Existing)
             && (entry.sequence_number.is_none() || entry.file_sequence_number.is_none())
@@ -413,6 +433,8 @@ impl ManifestWriter {
                 "Manifest entry with status Existing or Deleted should have sequence number",
             ));
         }
+
+        self.assign_data_file_first_row_id(&mut entry)?;
 
         // Update the statistics
         match entry.status {
@@ -435,6 +457,37 @@ impl ManifestWriter {
             self.min_seq_num = Some(self.min_seq_num.map_or(seq_num, |v| min(v, seq_num)));
         }
         self.manifest_entries.push(entry);
+        Ok(())
+    }
+
+
+    fn assign_data_file_first_row_id(&mut self, entry: &mut ManifestEntry) -> Result<()> {
+        if self.metadata.format_version != FormatVersion::V3
+            || self.metadata.content != ManifestContentType::Data
+        {
+            return Ok(());
+        }
+        let Some(cursor) = self.next_data_file_row_id else {
+            return Ok(());
+        };
+        if entry.status != ManifestStatus::Added {
+            return Ok(());
+        }
+        if entry.data_file.first_row_id.is_none() {
+            entry.data_file.first_row_id = Some(u64_to_i64_row_id(cursor)?);
+        }
+        self.next_data_file_row_id = cursor
+            .checked_add(entry.data_file.record_count)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Row ID overflow assigning DataFile.first_row_id (cursor={cursor}, record_count={})",
+                        entry.data_file.record_count
+                    ),
+                )
+            })
+            .map(Some)?;
         Ok(())
     }
 

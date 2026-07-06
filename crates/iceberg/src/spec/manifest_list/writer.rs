@@ -240,9 +240,38 @@ impl ManifestListWriter {
         match manifest.content {
             ManifestContentType::Data => {
                 match (self.next_row_id, manifest.first_row_id) {
-                    (Some(_), Some(_)) => {
-                        // Case: Manifest with already assigned first row ID.
-                        // No need to increase next_row_id, as this manifest is already assigned.
+                    (Some(writer_next_row_id), Some(manifest_first_row_id)) => {
+                        match manifest_first_row_id.cmp(&writer_next_row_id) {
+                            // Carry-over manifest from a previous snapshot — skip.
+                            std::cmp::Ordering::Less => {}
+                            // New manifest pre-assigned by SnapshotProducer — advance.
+                            std::cmp::Ordering::Equal => {
+                                let (existing_rows_count, added_rows_count) =
+                                    require_row_counts_in_manifest(manifest)?;
+                                self.next_row_id = writer_next_row_id
+                                    .checked_add(existing_rows_count)
+                                    .and_then(|sum| sum.checked_add(added_rows_count))
+                                    .ok_or_else(|| {
+                                        Error::new(
+                                            ErrorKind::DataInvalid,
+                                            format!(
+                                                "Row ID overflow when computing next row ID for Manifest {}. Next Row ID: {writer_next_row_id}, Existing Rows Count: {existing_rows_count}, Added Rows Count: {added_rows_count}",
+                                                manifest.manifest_path
+                                            ),
+                                        )
+                                    }).map(Some)?;
+                            }
+                            // Manifest is ahead of writer cursor — data corruption.
+                            std::cmp::Ordering::Greater => {
+                                return Err(Error::new(
+                                    ErrorKind::DataInvalid,
+                                    format!(
+                                        "first-row-id for Manifest {} is ahead of writer cursor (manifest={manifest_first_row_id}, writer next-row-id={writer_next_row_id}).",
+                                        manifest.manifest_path
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     (None, Some(manifest_first_row_id)) => {
                         // Case: Assigned first row ID for data manifest, but the writer does not have a next-row-id assigned.
